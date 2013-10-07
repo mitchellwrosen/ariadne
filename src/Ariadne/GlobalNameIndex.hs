@@ -12,15 +12,12 @@ import Data.Maybe
 
 import Ariadne.Types
 
-mkGlobalNameIndex
-  :: Global.Table -> Module SrcLoc -> GlobalNameIndex
+mkGlobalNameIndex :: Global.Table -> Module SrcLoc -> GlobalNameIndex
 mkGlobalNameIndex tbl mod =
   let
     Module _ _ _ _ ds = mod
     ModuleName _ modname = getModuleName mod
-
     names = concatMap (indexDecl tbl) ds
-
   in
     Map.fromList
       [ ((OrigName Nothing (GName modname (nameToString n)), level), ann n)

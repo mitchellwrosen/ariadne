@@ -1,87 +1,82 @@
-{-# LANGUAGE ViewPatterns, OverloadedStrings #-}
+{-# LANGUAGE LambdaCase, OverloadedStrings #-}
+
 module Main where
 
 import Ariadne.GlobalNameIndex
 import Ariadne.Index
 import qualified Ariadne.SrcMap as SrcMap
 
-import Language.Haskell.Names
-import Language.Haskell.Names.Interfaces
-import Language.Haskell.Names.SyntaxUtils
-import Language.Haskell.Names.Imports
+import Language.Haskell.Names (annotateModule)
+import Language.Haskell.Names.Interfaces (evalNamesModuleT)
+import Language.Haskell.Names.SyntaxUtils (getImports, moduleExtensions)
+import Language.Haskell.Names.Imports (processImports)
 import Language.Haskell.Exts.Annotated
-import Distribution.HaskellSuite.Packages
 
-import Control.Applicative
-import Control.Monad.Trans
-import Control.Monad
-import Control.Exception
-import Text.Printf
+import Control.Applicative ((<$>), (<*>), liftA2)
+import Control.Exception (SomeException, evaluate, try)
+import Text.Printf (printf)
 
-import Data.BERT
-import Network.BERT.Server
-import Network.BERT.Transport
+import Data.BERT (Term(..))
+import Network.BERT.Server (DispatchResult(..), serve)
+import Network.BERT.Transport (fromHostPort)
 import qualified Data.ByteString.Lazy.UTF8 as UTF8
 
 -- these should probably come from the Cabal file
 defaultLang = Haskell2010
 defaultExts = []
 
-work :: String -> Int -> Int -> IO (Maybe Origin)
-work mod line col = handleExceptions $ do
-  parseResult <-
-    parseFileWithMode
-      defaultParseMode { parseFilename = mod }
-      mod
-
-  case parseResult of
-    ParseFailed loc msg ->
-      return $ Just $ ResolveError $ printf "%s: %s" (prettyPrint loc) msg
-
-    ParseOk parsed -> do
-
-      let pkgs = []
-      (resolved, impTbl) <-
-        flip evalNamesModuleT pkgs $ do
-          -- computeInterfaces lang exts mod
-          let extSet = moduleExtensions defaultLang defaultExts parsed
-          (,) <$>
-            (annotateModule defaultLang defaultExts parsed) <*>
-            (fmap snd $ processImports extSet $ getImports parsed)
-
-      let
-        gIndex = mkGlobalNameIndex impTbl (getPointLoc <$> parsed)
-        srcMap = mkSrcMap gIndex (fmap srcInfoSpan <$> resolved)
-
-      return $ SrcMap.lookup noLoc { srcLine = line, srcColumn = col } srcMap
-  where
-    handleExceptions a =
-      try (a >>= evaluate) >>= either (\e -> return $ Just $ ResolveError $ show (e::SomeException)) return
-
-main = do
-  t <- fromHostPort "" 39014
-  serve t dispatch
+main = fromHostPort "" 39014 >>= flip serve dispatch
   where
     -- dispatch _ _ args = do print args; return $ Success $ NilTerm
+    dispatch :: String -> String -> [Term] -> IO DispatchResult
     dispatch "ariadne" "find" [BinaryTerm file, IntTerm line, IntTerm col] =
-      work (UTF8.toString file) line col >>= \result -> return . Success $
-        case result of
-          Nothing -> TupleTerm [AtomTerm "no_name"]
-          Just (LocKnown (SrcLoc file' line' col')) ->
-            TupleTerm
-              [ AtomTerm "loc_known"
-              , BinaryTerm (UTF8.fromString file')
-              , IntTerm line'
-              , IntTerm col'
-              ]
-          Just (LocUnknown modName) ->
-            TupleTerm
-              [ AtomTerm "loc_unknown"
-              , BinaryTerm (UTF8.fromString modName)
-              ]
-          Just (ResolveError er) ->
-            TupleTerm
-              [ AtomTerm "error"
-              , BinaryTerm (UTF8.fromString er)
-              ]
+        toResult <$> work (UTF8.toString file) line col
     dispatch _ _ _ = return NoSuchFunction
+
+    toResult :: Maybe Origin -> DispatchResult
+    toResult = Success . TupleTerm . toTerms
+
+    toTerms :: Maybe Origin -> [Term]
+    toTerms Nothing = [ AtomTerm "no_name" ]
+    toTerms (Just (LocKnown (SrcLoc file' line' col'))) =
+        [ AtomTerm "loc_known"
+        , BinaryTerm (UTF8.fromString file')
+        , IntTerm line'
+        , IntTerm col'
+        ]
+    toTerms (Just (LocUnknown modName)) =
+        [ AtomTerm "loc_unknown"
+        , BinaryTerm (UTF8.fromString modName)
+        ]
+    toTerms (Just (ResolveError er)) =
+        [ AtomTerm "error"
+        , BinaryTerm (UTF8.fromString er)
+        ]
+
+work :: FilePath -> Int -> Int -> IO (Maybe Origin)
+work filename line col = handleExceptions $ do
+    parseFileWithMode parseMode filename >>= \case
+        ParseFailed loc msg -> return $ Just $ ResolveError $ printf "%s: %s" (prettyPrint loc) msg
+        ParseOk parsed -> do
+            (resolved, impTbl) <- flip evalNamesModuleT [] $ do
+                -- computeInterfaces lang exts mod
+                let extSet = moduleExtensions defaultLang defaultExts parsed
+                liftA2 (,)
+                  (annotateModule defaultLang defaultExts parsed)
+                  (fmap snd $ processImports extSet $ getImports parsed)
+
+            let srcMap = getSrcMap parsed impTbl resolved
+            return $ SrcMap.lookup noLoc { srcLine = line, srcColumn = col } srcMap
+  where
+    handleExceptions :: IO (Maybe Origin) -> IO (Maybe Origin)
+    handleExceptions a = try (a >>= evaluate) >>= handleExceptions'
+      where
+        handleExceptions' :: Either SomeException (Maybe Origin) -> IO (Maybe Origin)
+        handleExceptions' = return . either (Just . ResolveError . show) id
+
+    parseMode :: ParseMode
+    parseMode = defaultParseMode { parseFilename = filename }
+
+    getSrcMap parsed impTbl resolved = mkSrcMap gIndex (fmap srcInfoSpan <$> resolved)
+      where
+        gIndex = mkGlobalNameIndex impTbl (getPointLoc <$> parsed)
