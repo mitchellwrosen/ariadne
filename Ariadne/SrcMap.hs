@@ -2,65 +2,57 @@
 --
 -- Notes:
 --
--- * the 'srcFilename' component is ignored
---
 -- * when some of the inserted intervals are overlapping, the behaviour is
 -- undefined
 {-# LANGUAGE ViewPatterns #-}
+
 module Ariadne.SrcMap
   ( SrcMap
+  , empty
   , insert
   , lookup
-  , union
-  , empty
   , singleton
+  , union
   ) where
 
+import Control.Monad (guard)
 import Prelude hiding (lookup)
-import Language.Haskell.Exts.SrcLoc hiding (Loc(..))
-import qualified Data.Map as Map
+import Language.Haskell.Exts.SrcLoc
 import Data.Monoid
+import qualified Data.Map as Map
 
--- | @Loc line column@
-data Loc = Loc !Int !Int
-  deriving (Eq, Ord, Show)
-
-newtype SrcMap a =
-  SrcMap
-  { unSrcMap :: Map.Map {- end -} Loc ({- start -} Loc, a)
+newtype SrcMap a = SrcMap
+  { unSrcMap :: Map.Map {- end -} SrcLoc ({- start -} SrcLoc, a)
   } deriving Show
 
 instance Monoid (SrcMap a) where
-  mempty = empty
+  mempty  = empty
   mappend = union
 
-spanStart, spanEnd :: SrcSpan -> Loc
-spanStart = uncurry Loc . srcSpanStart
-spanEnd = uncurry Loc . srcSpanEnd
-
-fromSrcLoc :: SrcLoc -> Loc
-fromSrcLoc SrcLoc { srcLine = line, srcColumn = col } = Loc line col
-
 insert :: SrcSpan -> a -> SrcMap a -> SrcMap a
-insert span value (SrcMap m) =
-  SrcMap $ Map.insert (spanEnd span) (spanStart span, value) m
+insert src_span value = SrcMap . Map.insert (srcSpanEnd' src_span) (srcSpanStart' src_span, value) . unSrcMap
+
+-- | Get the start SrcLoc from a SrcSpan.
+srcSpanStart' :: SrcSpan -> SrcLoc
+srcSpanStart' (SrcSpan filename start_line start_col _ _) = SrcLoc filename start_line start_col
+
+-- | Get the end SrcLoc from a SrcSpan.
+srcSpanEnd' :: SrcSpan -> SrcLoc
+srcSpanEnd' (SrcSpan filename _ _ end_line end_col) = SrcLoc filename end_line end_col
 
 lookup :: SrcLoc -> SrcMap a -> Maybe a
-lookup (fromSrcLoc -> loc) (SrcMap map) =
-  case Map.split loc map of
-    (_less, greater)
-      | Map.null greater -> Nothing
-      | otherwise ->
-        case Map.findMin greater of
-         (_, (start, value))
-          | start <= loc -> Just value
-          | otherwise -> Nothing
+lookup loc (SrcMap src_map) = do
+  let (_, greater) = Map.split loc src_map
+  guard $ Map.null greater
+  let (_, (start, value)) = Map.findMin greater
+  guard $ start > loc
+  return value
 
 union :: SrcMap a -> SrcMap a -> SrcMap a
-union (SrcMap a) (SrcMap b) = SrcMap (a `Map.union` b)
+union (SrcMap a) (SrcMap b) = SrcMap $ a `Map.union` b
 
 empty :: SrcMap a
 empty = SrcMap Map.empty
 
 singleton :: SrcSpan -> a -> SrcMap a
-singleton span value = insert span value empty
+singleton src_span value = insert src_span value empty
